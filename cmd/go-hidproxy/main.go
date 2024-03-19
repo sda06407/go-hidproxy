@@ -1,6 +1,6 @@
 package main
 
-// Go implementation of Bluetooth to USB HID proxy
+// Go implementation of USB to USB HID proxy
 // Author: Taneli Leppä <rosmo@rosmo.fi>
 // Licensed under Apache License 2.0
 
@@ -9,11 +9,13 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"reflect"
 	evdev "github.com/gvalkov/golang-evdev"
 	udev "github.com/jochenvg/go-udev"
-	"github.com/loov/hrtime"
 	"github.com/muka/go-bluetooth/api"
 	"github.com/muka/go-bluetooth/bluez/profile/adapter"
+	"github.com/loov/hrtime"
+	"golang.org/x/exp/slices"
 	log "github.com/sirupsen/logrus"
 	orderedmap "github.com/wk8/go-ordered-map"
 	"io/ioutil"
@@ -34,6 +36,10 @@ type InputMessage struct {
 	Message   []byte
 	Timestamp time.Duration
 }
+
+var startTime time.Time
+var endTime time.Time
+var elapsedTime time.Duration
 
 var Scancodes = map[uint16]uint16{
 	2:   30, // 1
@@ -76,7 +82,7 @@ var Scancodes = map[uint16]uint16{
 	51:  54, // <
 	52:  55, // >
 	53:  56, // ?
-	41:  50, // //
+	41:  50, // \\
 	43:  49, // \
 	30:  4,  // a
 	48:  5,  // b
@@ -149,6 +155,8 @@ const (
 	BUTTON_RIGHT  = 1 << 1
 	BUTTON_MIDDLE = 1 << 2
 )
+
+
 
 func SetupUSBGadget() {
 	var paths = []string{
@@ -256,7 +264,61 @@ func SetupUSBGadget() {
 	time.Sleep(1000 * time.Millisecond)
 }
 
+func remap(keycode []uint8, lastTypeCode []uint8) []uint8{
+	if slices.Index(keycode, 50)>=0{ //fix ` not work
+		idx := slices.Index(keycode, 50)
+		keycode[idx] = 53
+	}
+
+	if slices.Index(keycode, 224)>=0{ // change LCtrl to Capslock
+		idx := slices.Index(keycode, 224)
+		keycode[idx] = 57
+	}
+
+	if len(keycode) >=3 && keycode[0] == 2 && keycode[2] == 41{ // for shift + esc = ~ 
+		keycode[2] = 53
+	}
+	
+	if len(keycode) >=4 && keycode[2]==57{ 
+		idx := slices.Index(keycode, 57) // get capslock slice location
+		switch keycode[3]{
+
+		case 80: //LCTRL + LEFT = Home
+			keycode[0] = 0	
+			keycode[idx] = 74 //Home
+
+		case 79: //LCTRL + RIGHT = End
+			keycode[0] = 0	
+			keycode[idx] = 77 //End
+
+		case 82: //LCTRL + UP = Pgup
+			keycode[0] = 0	
+			keycode[idx] = 75 // Pgup
+
+		case 81: //LCTRL + Down = Pgdown
+			keycode[0] = 0	
+			keycode[idx] = 78 // Pgdown
+		default:
+			keycode[idx] = 57
+		}
+		
+	}
+	if len(keycode) >=3 && keycode[0]==1{ 
+		if keycode[2] == 42{
+			keycode[0] = 0
+			keycode[2] = 76 //Delete
+		}
+
+	}
+
+	return keycode
+}
+
+
+
+
 func HandleKeyboard(output chan<- error, input chan<- InputMessage, close <-chan bool, rate uint, delay uint, dev evdev.InputDevice) error {
+
 	keysDown := make([]uint16, 0)
 	err := dev.Grab()
 	if err != nil {
@@ -271,9 +333,10 @@ func HandleKeyboard(output chan<- error, input chan<- InputMessage, close <-chan
 
 	log.Infof("Setting repeat rate to %d, delay %d for %s (%s)", rate, delay, dev.Name, dev.Fn)
 	dev.SetRepeatRate(rate, delay)
-
+	lastTypeCode := make([]uint8, 0)
 	loop := 0
 	for {
+		
 		err = dev.File.SetReadDeadline(time.Now().Add(250 * time.Millisecond))
 		if err != nil {
 			log.Fatal(err)
@@ -291,15 +354,19 @@ func HandleKeyboard(output chan<- error, input chan<- InputMessage, close <-chan
 			return err
 		}
 		log.Debugf("Keyboard input event: type=%d, code=%d, value=%d", event.Type, event.Code, event.Value)
+		
 		if event.Type == evdev.EV_KEY {
+			log.Info("lastTypeCode", lastTypeCode)
 			keyEvent := evdev.NewKeyEvent(event)
-			log.Debugf("Key event: scancode=%d, keycode=%d, state=%d", keyEvent.Scancode, keyEvent.Keycode, keyEvent.State)
+			log.Info("Key event: scancode=%d, keycode=%d, state=%d", keyEvent.Scancode, keyEvent.Keycode, keyEvent.State)
 			if keyCode, ok := Scancodes[keyEvent.Scancode]; ok {
+
 				if keyEvent.State == 1 { // Key down
 					keyIsDown := false
 					for _, k := range keysDown {
 						if k == keyCode {
 							keyIsDown = true
+							
 						}
 					}
 					if !keyIsDown {
@@ -311,56 +378,77 @@ func HandleKeyboard(output chan<- error, input chan<- InputMessage, close <-chan
 					for _, k := range keysDown {
 						if k != keyCode {
 							newKeysDown = append(newKeysDown, k)
+							log.Info("newKeysDown ", newKeysDown)
 						}
 					}
 					keysDown = newKeysDown
+					
 				}
-
+				
+				
 				var modifiers uint8 = 0
 				keysToSend := make([]uint8, 0)
 				for _, k := range keysDown {
 					switch {
-					case k == 224: // Left-Ctrl
-						modifiers |= LEFT_CONTROL
-					case k == 227: // Left-Cmd
-						modifiers |= LEFT_META
-					case k == 225: // Left-Shift
-						modifiers |= LEFT_SHIFT
-					case k == 226: // Left-Alt
-						modifiers |= LEFT_ALT
-					case k == 228: // Right-Ctrl
-						modifiers |= RIGHT_CONTROL
-					case k == 231: // Right-Cmd
-						modifiers |= RIGHT_META
-					case k == 229: // Right-Shift
-						modifiers |= RIGHT_SHIFT
-					case k == 230: // Right-Alt
-						modifiers |= RIGHT_ALT
-					default:
-						keysToSend = append(keysToSend, uint8(k))
+						case k == 57: // change capslock to LCtrl
+							k=224
+							modifiers |= LEFT_CONTROL
+						case k == 227: // Left-Cmd
+							modifiers |= LEFT_META
+						case k == 225: // Left-Shift
+							modifiers |= LEFT_SHIFT
+						case k == 226: // Left-Alt
+							modifiers |= LEFT_ALT
+						case k == 228: // Right-Ctrl
+							modifiers |= RIGHT_CONTROL
+						case k == 231: // Right-Cmd
+							modifiers |= RIGHT_META
+						case k == 229: // Right-Shift
+							modifiers |= RIGHT_SHIFT
+						case k == 230: // Right-Alt
+							modifiers |= RIGHT_ALT
+						default:
+							keysToSend = append(keysToSend, uint8(k))
 					}
 				}
+				
 				keysToSend = append([]uint8{modifiers, 0}, keysToSend...)
+				checkTime := make([]uint8, len(keysToSend))
+
+				if  reflect.DeepEqual(checkTime, keysToSend){
+					endTime = time.Now()
+					elapsedTime = endTime.Sub(startTime)
+					log.Info("key press time is ", elapsedTime)
+					elapsedTime = 0
+				} else {
+					startTime = time.Now()
+				}
+				keysToSend = remap(keysToSend, lastTypeCode)
+				
 				if len(keysToSend) < 8 {
 					for i := len(keysToSend); i < 8; i++ {
 						keysToSend = append(keysToSend, uint8(0))
 					}
 				}
+
 				input <- InputMessage{
 					Timestamp: hrtime.Now(),
 					Message: keysToSend,
-				}
-
-				log.Debugf("Key status (scancode %d, keycode %d): %v\n", keyEvent.Scancode, keyCode, keysToSend)
+				}	
+				lastTypeCode = keysToSend
+				
+				log.Info("Key status (scancode %d, keycode %d): %v\n", keyEvent.Scancode, keyCode, keysToSend)
 			} else {
 				log.Warnf("Unknown scancode: %d\n", keyEvent.Scancode)
 			}
+			
 		}
+		
 		loop += 1
 		if loop > 3 {
 			select {
 			case _ = <-close:
-				log.Infof("Stopping processing keyboard input from: %s (%s)", dev.Name, dev.Fn)
+				log.Info("Stopping processing keyboard input from: %s (%s)", dev.Name, dev.Fn)
 				output <- nil
 				return nil
 			default:
@@ -449,6 +537,7 @@ func HandleMouse(output chan<- error, input chan<- InputMessage, close <-chan bo
 				if event.Code == 11 {
 					mouseToSend = append(mouseToSend, 0x00)
 					mouseToSend = append(mouseToSend, 0x00)
+					event.Value = event.Value/100 // scroll speed
 					mouseToSend = append(mouseToSend, uint8(event.Value))
 				}
 			} else {
@@ -651,7 +740,7 @@ func main() {
 	if *monitorUdev {
 		log.Info("Starting udev monitoring for Bluetooth devices")
 		m := u.NewMonitorFromNetlink("udev")
-		m.FilterAddMatchSubsystem("bluetooth")
+		m.FilterAddMatchSubsystem("usb")
 
 		ctx, cancel = context.WithCancel(context.Background())
 		udevCh, _ = m.DeviceChan(ctx)
@@ -687,6 +776,11 @@ func main() {
 		}
 
 		log.Info("Polling for new devices in /dev/input\n")
+		if startTime.After(endTime){
+			tmpTime := time.Now()
+			elapsedTime = tmpTime.Sub(startTime)
+			log.Info("elapsedTime is ", elapsedTime)
+		}
 		devices, _ := evdev.ListInputDevices()
 		for _, dev := range devices {
 			isMouse := false
@@ -705,6 +799,7 @@ func main() {
 					Device: dev.Fn,
 					Name:   dev.Name,
 				}
+				
 				if _, ok := output[devId]; !ok {
 					output[devId] = make(chan error, 10)
 					close[devId] = make(chan bool, 10)
